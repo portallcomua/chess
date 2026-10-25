@@ -46,3 +46,4 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 = 1.0.0 =
 * Перший офіційний реліз з підтримкою GitHub Auto-Update, 8 тем дошки, PWA та ШІ-коуча.
+Тестую роботу з Codespace
