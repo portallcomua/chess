@@ -3,7 +3,7 @@
  * Plugin Name: Шахи проти ШІ
  * Plugin URI: https://uaserver.pp.ua/chess/
  * Description: Повнофункціональна шахова платформа з підтримкою PWA, 8 унікальними дизайнами дошки, ШІ-тренером, на двох мовах: українська та англійська.
- * Version: 2.0.1
+ * Version: 2.1.0
  * Author: UAServer
  * Author URI: https://uaserver.pp.ua/
  * GitHub Plugin URI: https://github.com/portallcomua/chess
@@ -17,78 +17,117 @@
  * Domain Path: /languages
  */
 
-// Заборона прямого виклику файлу поза WordPress
 if (!defined('ABSPATH')) {
     exit;
 }
 
-define('WP_CHESS_VERSION', '2.0.1');
+define('WP_CHESS_VERSION', '2.1.0');
 define('WP_CHESS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WP_CHESS_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('WP_CHESS_PRO_PROJECT_ID', 3); // ID проекту «Шахи PRO» у плагіні монетизації (UA Pay Box)
 
 /**
- * Інтеграція з UA Pay Box («Шахи PRO пожиттєвий», ID проекту 3)
+ * 0. Допоміжні функції: гравці та статус PRO
+ * Єдине джерело істини про PRO — колонка status у таблиці chess_players
+ * (синхронізується з плагіном монетизації через wcc_check_user_premium).
  */
-function chess_domain() {
-    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
-    $host = preg_replace('/:\d+$/', '', strtolower(trim($host)));
-    return preg_replace('/^www\./', '', $host);
+function wp_chess_table() {
+    global $wpdb;
+    return $wpdb->prefix . 'chess_players';
 }
 
-function chess_hub() {
-    return 'https://uaserver.pp.ua/wp-json/upb/v1/';
+function wp_chess_get_player($email) {
+    global $wpdb;
+    $email = sanitize_email(strtolower(trim((string) $email)));
+    if ($email === '') {
+        return null;
+    }
+    return $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . wp_chess_table() . ' WHERE email = %s', $email));
 }
 
-function chess_state( $force = false ) {
-    $c = get_option( 'chess_pro' );
-    $c = is_array( $c ) ? $c : array( 'state' => 'free', 'expires' => 0, 'checked' => 0 );
-    if ( $force || time() - (int) $c['checked'] > 6 * HOUR_IN_SECONDS ) {
-        $r = wp_remote_get( add_query_arg( array( 'service' => 'chess', 'domain' => chess_domain() ), chess_hub() . 'status' ), array( 'timeout' => 8 ) );
-        if ( ! is_wp_error( $r ) && 200 === (int) wp_remote_retrieve_response_code( $r ) ) {
-            $j = json_decode( wp_remote_retrieve_body( $r ), true );
-            if ( is_array( $j ) && isset( $j['state'] ) ) {
-                $c = array( 'state' => $j['state'], 'expires' => (int) $j['expires'], 'checked' => time() );
-                update_option( 'chess_pro', $c, false );
+// Створює запис гравця для існуючого користувача WordPress (якщо його ще немає)
+function wp_chess_ensure_player($email) {
+    global $wpdb;
+    $row = wp_chess_get_player($email);
+    if ($row) {
+        return $row;
+    }
+    $wp_user = get_user_by('email', $email);
+    if (!$wp_user) {
+        return null;
+    }
+    $wpdb->insert(wp_chess_table(), array(
+        'username'      => mb_substr($wp_user->display_name ? $wp_user->display_name : $wp_user->user_login, 0, 60),
+        'email'         => strtolower($wp_user->user_email),
+        'password_hash' => $wp_user->user_pass,
+        'status'        => 'FREE',
+        'registered_at' => current_time('mysql'),
+    ));
+    return wp_chess_get_player($email);
+}
+
+function wp_chess_is_pro_email($email) {
+    global $wpdb;
+    $row = wp_chess_get_player($email);
+    $status = $row ? $row->status : 'FREE';
+    if ($status !== 'PRO' && function_exists('wcc_check_user_premium')) {
+        $wp_user = get_user_by('email', $email);
+        if ($wp_user && wcc_check_user_premium($wp_user->ID, WP_CHESS_PRO_PROJECT_ID)) {
+            $row = wp_chess_ensure_player($email);
+            if ($row) {
+                $wpdb->update(wp_chess_table(), array('status' => 'PRO'), array('id' => $row->id));
             }
-        } elseif ( time() - (int) $c['checked'] > 7 * DAY_IN_SECONDS ) {
-            $c['state'] = 'free';
+            $status = 'PRO';
         }
     }
-    return $c;
+    return $status === 'PRO';
 }
 
-// true - для цього домену є чинний PRO
-function chess_is_pro() {
-    $c = chess_state();
-    return in_array( $c['state'], array( 'active', 'expiring', 'unlimited' ), true ) && ( ! $c['expires'] || $c['expires'] > time() );
+function wp_chess_grant_pro($email) {
+    global $wpdb;
+    $row = wp_chess_ensure_player($email);
+    if (!$row) {
+        return false;
+    }
+    $wpdb->update(wp_chess_table(), array('status' => 'PRO'), array('id' => $row->id));
+    $wp_user = get_user_by('email', $row->email);
+    if ($wp_user) {
+        update_user_meta($wp_user->ID, '_wcc_user_premium_' . WP_CHESS_PRO_PROJECT_ID, '1');
+        update_user_meta($wp_user->ID, 'wcc_chess_pro', '1');
+        if (function_exists('wcc_set_user_premium')) {
+            wcc_set_user_premium($wp_user->ID, WP_CHESS_PRO_PROJECT_ID, true);
+        }
+    }
+    return true;
 }
 
-// Викличте при кліку «Купити PRO» і відкрийте у новій вкладці посилання на оплату — PRO вмикається одразу.
-// Повертає масив з ключем 'url' (Конверт) або WP_Error. У коментарі до платежу клієнт має вказати ДОМЕН.
-function chess_activate_pro() {
-    $r = wp_remote_post( chess_hub() . 'activate', array( 'timeout' => 15, 'body' => array(
-        'service' => 'chess', 'domain' => chess_domain(), 'email' => get_option( 'admin_email' ), 'site_url' => home_url(),
-    ) ) );
-    if ( is_wp_error( $r ) ) {
-        return $r;
+function wp_chess_revoke_pro($email) {
+    global $wpdb;
+    $row = wp_chess_get_player($email);
+    if (!$row) {
+        return false;
     }
-    $j = json_decode( wp_remote_retrieve_body( $r ), true );
-    if ( 200 !== (int) wp_remote_retrieve_response_code( $r ) || ! is_array( $j ) ) {
-        return new WP_Error( 'pay', isset( $j['message'] ) ? $j['message'] : 'Помилка сервера оплати' );
+    $wpdb->update(wp_chess_table(), array('status' => 'FREE'), array('id' => $row->id));
+    $wp_user = get_user_by('email', $row->email);
+    if ($wp_user) {
+        delete_user_meta($wp_user->ID, '_wcc_user_premium_' . WP_CHESS_PRO_PROJECT_ID);
+        delete_user_meta($wp_user->ID, 'wcc_chess_pro');
+        if (function_exists('wcc_set_user_premium')) {
+            wcc_set_user_premium($wp_user->ID, WP_CHESS_PRO_PROJECT_ID, false);
+        }
     }
-    chess_state( true );
-    return $j;
+    return true;
 }
 
 /**
- * 1. Активація плагіна: створення окремої таблиці шахістів та налаштувань
+ * 1. Активація плагіна: таблиця шахістів, налаштування, роль «Шахіст»
  */
-function wp_chess_activate_plugin() {
+function wp_chess_create_table() {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
+    $table_name = wp_chess_table();
     $charset_collate = $wpdb->get_charset_collate();
 
-    $sql = "CREATE TABLE IF NOT EXISTS $table_name (
+    $sql = "CREATE TABLE $table_name (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
         username varchar(60) NOT NULL,
         email varchar(100) NOT NULL,
@@ -99,15 +138,19 @@ function wp_chess_activate_plugin() {
         wins int(11) NOT NULL DEFAULT 0,
         hints_used_today int(11) NOT NULL DEFAULT 0,
         last_hint_date date DEFAULT NULL,
-        PRIMARY KEY (id),
+        PRIMARY KEY  (id),
         UNIQUE KEY email (email),
         KEY username (username)
     ) $charset_collate;";
 
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
+    update_option('wp_chess_db_version', WP_CHESS_VERSION);
+}
 
-    // Початкові налаштування за замовчуванням
+function wp_chess_activate_plugin() {
+    wp_chess_create_table();
+
     if (get_option('wp_chess_price_text') === false) {
         update_option('wp_chess_price_text', '79 ₴');
     }
@@ -116,9 +159,6 @@ function wp_chess_activate_plugin() {
     }
     if (get_option('wp_chess_card_url') === false) {
         update_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-    }
-    if (get_option('wp_chess_test_mode') === false) {
-        update_option('wp_chess_test_mode', '0');
     }
     if (get_option('wp_chess_online_time') === false) {
         update_option('wp_chess_online_time', 15);
@@ -129,28 +169,53 @@ function wp_chess_activate_plugin() {
     if (get_option('wp_chess_guide_content') === false) {
         update_option('wp_chess_guide_content', wp_chess_get_default_guide_content());
     }
+    delete_option('wp_chess_test_mode');
+    delete_option('chess_pro');
 
-    // Реєстрація спеціальної ролі WordPress «Шахіст»
-    if (!get_role('chess_player')) {
-        add_role('chess_player', 'Шахіст', array(
-            'read' => true,
-        ));
-    }
-
-    // Автоматично створюємо локальну папку app/ з грою
+    wp_chess_register_custom_role();
     wp_chess_ensure_local_app(true);
 }
 register_activation_hook(__FILE__, 'wp_chess_activate_plugin');
 
-// Гарантуємо реєстрацію ролі «Шахіст» при кожному запуску WordPress
 function wp_chess_register_custom_role() {
     if (!get_role('chess_player')) {
-        add_role('chess_player', 'Шахіст', array(
-            'read' => true,
-        ));
+        add_role('chess_player', 'Шахіст', array('read' => true));
     }
 }
 add_action('init', 'wp_chess_register_custom_role');
+
+// Оновлення структури БД та чистка старих налаштувань після апдейту плагіна
+function wp_chess_maybe_upgrade() {
+    if (get_option('wp_chess_db_version') !== WP_CHESS_VERSION) {
+        wp_chess_create_table();
+        delete_option('wp_chess_test_mode');
+        delete_option('chess_pro');
+        wp_chess_ensure_local_app(true);
+    }
+}
+add_action('init', 'wp_chess_maybe_upgrade', 5);
+
+// Шахісти не потрапляють в адмінку WordPress
+function wp_chess_is_chess_player_only($user = null) {
+    $user = $user ? $user : wp_get_current_user();
+    return $user && $user->exists() && !empty($user->roles) && count($user->roles) === 1 && in_array('chess_player', $user->roles, true);
+}
+add_filter('show_admin_bar', function ($show) {
+    return wp_chess_is_chess_player_only() ? false : $show;
+});
+add_action('admin_init', function () {
+    if (!wp_doing_ajax() && wp_chess_is_chess_player_only()) {
+        wp_safe_redirect(home_url('/'));
+        exit;
+    }
+});
+add_filter('login_redirect', function ($redirect, $request, $user) {
+    if ($user instanceof WP_User && wp_chess_is_chess_player_only($user)) {
+        $page = (int) get_option('wp_chess_page_id', 0);
+        return $page ? get_permalink($page) : home_url('/');
+    }
+    return $redirect;
+}, 10, 3);
 
 /**
  * 2. Автоматичне оновлення плагіна з GitHub (portallcomua/chess)
@@ -271,7 +336,6 @@ function wp_chess_render_admin_page() {
             update_option('wp_chess_paypal_url', esc_url_raw($_POST['wp_chess_paypal_url']));
         }
         update_option('wp_chess_card_url', esc_url_raw($_POST['wp_chess_card_url']));
-        update_option('wp_chess_test_mode', isset($_POST['wp_chess_test_mode']) ? '1' : '0');
 
         // Оновлюємо гру на диску з новими параметрами
         wp_chess_ensure_local_app(true);
@@ -289,9 +353,15 @@ function wp_chess_render_admin_page() {
     if (isset($_GET['action'], $_GET['player_id']) && $_GET['action'] === 'toggle_status') {
         $pid = absint($_GET['player_id']);
         check_admin_referer('toggle_player_' . $pid);
-        $current_status = $wpdb->get_var($wpdb->prepare("SELECT status FROM $table_name WHERE id = %d", $pid));
-        $new_status = ($current_status === 'PRO') ? 'FREE' : 'PRO';
-        $wpdb->update($table_name, array('status' => $new_status), array('id' => $pid));
+        $prow = $wpdb->get_row($wpdb->prepare("SELECT email, status FROM $table_name WHERE id = %d", $pid));
+        $new_status = ($prow && $prow->status === 'PRO') ? 'FREE' : 'PRO';
+        if ($prow) {
+            if ($new_status === 'PRO') {
+                wp_chess_grant_pro($prow->email);
+            } else {
+                wp_chess_revoke_pro($prow->email);
+            }
+        }
         echo '<div class="notice notice-success is-dismissible"><p>Статус гравця #' . $pid . ' змінено на <strong>' . $new_status . '</strong></p></div>';
     }
 
@@ -317,7 +387,6 @@ function wp_chess_render_admin_page() {
     $daily_hints = get_option('wp_chess_daily_hints', 10);
     $paypal_url = get_option('wp_chess_paypal_url', 'https://www.paypal.com/checkout?amount=1.99');
     $card_url = get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-    $test_mode = get_option('wp_chess_test_mode', '0');
     $local_index = WP_CHESS_PLUGIN_DIR . 'app/index.html';
     $has_local_file = file_exists($local_index) && filesize($local_index) > 1000;
     ?>
@@ -361,7 +430,7 @@ function wp_chess_render_admin_page() {
                                 <input name="wp_chess_card_url" type="url" id="wp_chess_card_url" value="<?php echo esc_attr($card_url); ?>" placeholder="https://www.privat24.ua/send/k4m09" class="large-text">
                                 <p class="description" style="color:#0f172a; font-weight:500; margin-top:5px;">
                                     Введіть посилання на ваш Приват-Конверт у Приват24 (наприклад, <code>https://www.privat24.ua/send/k4m09</code>).<br>
-                                    При кліку на «Сплатити» гра відкриває це посилання в новій вкладці та <strong>миттєво надає гравцю статус PRO</strong> (довічний доступ до всіх 8 дизайнів дошки та необмежені підказки ШІ-тренера).
+                                    При кліку на «Сплатити» гра відкриває це посилання в новій вкладці та <strong>миттєво надає гравцю статус PRO</strong> (потім ви підтверджуєте оплату у Приват24 і за потреби блокуєте PRO на вкладці «База шахістів») (довічний доступ до всіх 8 дизайнів дошки та необмежені підказки ШІ-тренера).
                                 </p>
                             </td>
                         </tr>
@@ -374,18 +443,6 @@ function wp_chess_render_admin_page() {
                             </td>
                         </tr>
                         -->
-                        <tr style="background:#f8fafc; border-top:1px solid #e2e8f0; border-bottom:1px solid #e2e8f0;">
-                            <th scope="row"><label for="wp_chess_test_mode">Тестовий режим (імітація оплат):</label></th>
-                            <td>
-                                <label for="wp_chess_test_mode" style="font-weight:600; color:#0f172a; cursor:pointer;">
-                                    <input name="wp_chess_test_mode" type="checkbox" id="wp_chess_test_mode" value="1" <?php checked($test_mode, '1'); ?>>
-                                    ⚡ Увімкнути тестовий режим для кнопок оплати
-                                </label>
-                                <p class="description" style="margin-top:5px; color:#475569;">
-                                    Коли галочка увімкнена, натискання на кнопку «Сплатити» <strong>не здійснює перехід</strong> на сторонні сайти. Натомість гра миттєво імітує успішний платіж, виводить сповіщення <em>«Тестовий платіж успішний! Статус PRO активовано.»</em> та відкриває гравцю довічний безліміт на всі дизайни та підказки.
-                                </p>
-                            </td>
-                        </tr>
                         <tr>
                             <th scope="row">Автономний рушій гри:</th>
                             <td>
@@ -419,7 +476,7 @@ function wp_chess_render_admin_page() {
             <!-- Вкладка 2: База користувачів -->
             <div style="background:#fff; border:1px solid #ccd0d4; padding:20px; border-radius:8px; margin-top:15px;">
                 <h2>👥 Зареєстровані шахісти (Автономна база)</h2>
-                <p>Користувачі шахів ізольовані від адмінки WordPress — вони не мають доступу до панелі сайту.</p>
+                <p>Кожен шахіст також є користувачем WordPress з роллю «Шахіст» (без доступу до панелі сайту). Статус PRO тут — єдине джерело істини для гри.</p>
 
                 <?php
                 $players = $wpdb->get_results("SELECT * FROM $table_name ORDER BY id DESC LIMIT 100");
@@ -517,10 +574,46 @@ function wp_chess_render_admin_page() {
     <?php
 }
 
+
 /**
- * 5. Прямий кінцевий пункт (Direct Endpoint) для гри
- * Працює завжди на 100%, навіть якщо на хостингу заблоковано запис у файлову систему!
- * Запобігає кешуванню будь-якими плагінами кешу (WP-Super-Cache, LiteSpeed, W3TC тощо).
+ * 5. Конфігурація гри для сторінки (передається в iframe через window.WP_CHESS_CONFIG)
+ */
+function wp_chess_build_config() {
+    global $wpdb;
+    $table_name = wp_chess_table();
+
+    $current_uid = get_current_user_id();
+    $wp_u = $current_uid > 0 ? wp_get_current_user() : null;
+    $email = ($wp_u && !empty($wp_u->user_email)) ? $wp_u->user_email : '';
+
+    $page_id = (int) get_option('wp_chess_page_id', 0);
+    $page_url = $page_id ? get_permalink($page_id) : '';
+    if (!$page_url) {
+        $page_url = home_url('/');
+    }
+
+    return array(
+        'pageUrl'               => $page_url,
+        'iconUrl'               => plugins_url('app/pwa-192x192.png', __FILE__),
+        'priceText'             => get_option('wp_chess_price_text', '79 ₴'),
+        'dailyHints'            => intval(get_option('wp_chess_daily_hints', 10)),
+        'cardUrl'               => get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09'),
+        'apiUrl'                => rest_url('chess/v1'),
+        'lostPasswordUrl'       => wp_lostpassword_url($page_url),
+        'hasMonetizationPlugin' => function_exists('wcc_check_user_premium'),
+        'isUserPremium'         => ($email !== '' && wp_chess_is_pro_email($email)),
+        'isBlocked'             => false,
+        'userId'                => intval($current_uid),
+        'userEmail'             => $email,
+        'userName'              => ($wp_u && !empty($wp_u->display_name)) ? $wp_u->display_name : '',
+        'totalPlayers'          => max(1, (int) $wpdb->get_var("SELECT COUNT(*) FROM $table_name")),
+        'totalGames'            => max((int) $wpdb->get_var("SELECT COALESCE(SUM(games_played), 0) FROM $table_name"), (int) get_option('wp_chess_total_games_count', 0)),
+        'onlinePlayers'         => max(1, wp_chess_record_session_ping()),
+    );
+}
+
+/**
+ * 6. Прямий кінцевий пункт (Direct Endpoint) для гри
  */
 function wp_chess_embed_listener() {
     if (isset($_GET['wp_chess_embed'])) {
@@ -529,9 +622,6 @@ function wp_chess_embed_listener() {
         if (!defined('DONOTMINIFY')) define('DONOTMINIFY', true);
         if (!defined('DONOTCDN')) define('DONOTCDN', true);
         nocache_headers();
-        header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0, post-check=0, pre-check=0');
-        header('Pragma: no-cache');
-        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
         header('Content-Type: text/html; charset=UTF-8');
         header('X-Robots-Tag: noindex, nofollow');
         echo wp_chess_get_game_html();
@@ -540,9 +630,6 @@ function wp_chess_embed_listener() {
 }
 add_action('init', 'wp_chess_embed_listener', 1);
 
-/**
- * 6. Отримання чистого HTML коду шахів з конфігурацією сайту
- */
 function wp_chess_get_game_html() {
     $local_file = WP_CHESS_PLUGIN_DIR . 'app/index.html';
     $html = '';
@@ -550,120 +637,43 @@ function wp_chess_get_game_html() {
     if (file_exists($local_file) && filesize($local_file) > 1000) {
         $html = @file_get_contents($local_file);
     }
-
     if (empty($html) || strlen($html) < 1000) {
         $html = wp_chess_decode_embedded_payload();
     }
 
-    // Вставляємо <base href="..."> для усунення чорного екрану при будь-якому вбудовуванні
-    $app_base_url = esc_url(plugins_url('app/', __FILE__));
-    $base_tag = '<base href="' . $app_base_url . '">';
+    $base_tag = '<base href="' . esc_url(plugins_url('app/', __FILE__)) . '">';
     if (strpos($html, '<base ') === false) {
         if (strpos($html, '<head>') !== false) {
             $html = str_replace('<head>', '<head>' . "\n  " . $base_tag, $html);
-        } elseif (strpos($html, '<head ') !== false) {
-            $html = preg_replace('/(<head[^>]*>)/i', '$1' . "\n  " . $base_tag, $html, 1);
         } else {
             $html = $base_tag . $html;
         }
     }
 
-    // Динамічне підставлення актуальних налаштувань адміністратора
-    $price_text = get_option('wp_chess_price_text', '79 ₴');
-    $daily_hints = get_option('wp_chess_daily_hints', 10);
-    $paypal_url = get_option('wp_chess_paypal_url', 'https://www.paypal.com/checkout?amount=1.99');
-    $card_url = get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-    $test_mode = (get_option('wp_chess_test_mode', '0') === '1');
-    $api_url = rest_url('chess/v1');
-
-    // Перевірка статусу користувача та інтеграція з UA Pay Box
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-    $current_uid = get_current_user_id();
-    $wp_u = $current_uid > 0 ? wp_get_current_user() : null;
-    $has_wcc = function_exists('wcc_check_user_premium');
-    $is_user_premium = false;
-    $is_explicitly_blocked = false;
-
-    // 1. Якщо для всього сайту / домену активовано PRO в UA Pay Box:
-    if (chess_is_pro()) {
-        $is_user_premium = true;
-    }
-    // 2. Інтеграція з плагіном UA Pay Box / WCC (проект «Шахи PRO пожиттєвий», ID 3):
-    elseif ($current_uid > 0 && $has_wcc) {
-        if (wcc_check_user_premium($current_uid, 3)) {
-            $is_user_premium = true;
-        } else {
-            $is_user_premium = false;
-            $is_explicitly_blocked = false;
-        }
-    }
-    // 3. Перевірка статусу в локальній базі шахістів:
-    elseif ($current_uid > 0 && $wp_u && !empty($wp_u->user_email)) {
-        $db_status = $wpdb->get_var($wpdb->prepare("SELECT status FROM $table_name WHERE email = %s", $wp_u->user_email));
-        if ($db_status === 'PRO') {
-            $is_user_premium = true;
-        } elseif ($db_status === 'FREE') {
-            $is_user_premium = false;
-            $is_explicitly_blocked = false;
-        }
-    }
-
-    // 4. Адміністратор сайту або тестовий режим завжди мають PRO:
-    if (current_user_can('manage_options') || $test_mode || ($wp_u && $wp_u->user_email === 'portall.mail@gmail.com')) {
-        $is_user_premium = true;
-        $is_explicitly_blocked = false;
-    }
-
-    // Шорткод / кнопка UA Pay Box
-    $buy_button_html = '';
-    if (shortcode_exists('universal_pay_box')) {
-        $buy_button_html = do_shortcode('[universal_pay_box id="3"]');
-    } elseif (class_exists('UM_Helpers') && method_exists('UM_Helpers', 'buy_button')) {
-        $buy_button_html = UM_Helpers::buy_button(3, 'Купити PRO');
-    } else {
-        $buy_button_html = '<button data-upb-buy="3" class="button button-primary">Купити PRO</button>';
-    }
-
-    $config_script = "<script>
-      window.WP_CHESS_CONFIG = {
-        priceText: " . json_encode($price_text) . ",
-        dailyHints: " . intval($daily_hints) . ",
-        paypalUrl: " . json_encode($paypal_url) . ",
-        cardUrl: " . json_encode($card_url) . ",
-        testMode: " . ($test_mode ? 'true' : 'false') . ",
-        apiUrl: " . json_encode($api_url) . ",
-        hasMonetizationPlugin: " . ($has_wcc ? 'true' : 'false') . ",
-        isUserPremium: " . ($is_user_premium ? 'true' : 'false') . ",
-        isBlocked: " . ($is_explicitly_blocked ? 'true' : 'false') . ",
-        userId: " . intval($current_uid) . ",
-        userEmail: " . json_encode(($wp_u && !empty($wp_u->user_email)) ? $wp_u->user_email : '') . ",
-        userName: " . json_encode(($wp_u && !empty($wp_u->display_name)) ? $wp_u->display_name : '') . ",
-        buyButtonHtml: " . json_encode($buy_button_html) . "
-      };
-    </script>";
-
+    $config_script = '<script>window.WP_CHESS_CONFIG = ' . wp_json_encode(wp_chess_build_config()) . ';</script>';
     if (strpos($html, '</head>') !== false) {
         return str_replace('</head>', $config_script . '</head>', $html);
     }
-
     return $config_script . $html;
 }
 
 /**
- * 7. Шорткод 1: [wp_chess_pwa] (Шахова гра)
+ * 7. Шорткод [wp_chess_pwa]
  */
 function wp_chess_game_shortcode($atts) {
-    // 1. Автоматична перевірка та створення локального файлу app/index.html (якщо хостинг дозволяє)
     wp_chess_ensure_local_app();
 
-    // 2. Визначення URL з міткою часу для обходу будь-якого кешу
+    // Запам'ятовуємо сторінку з грою (для маніфесту PWA)
+    $pid = get_the_ID();
+    if ($pid && is_singular() && (int) get_option('wp_chess_page_id', 0) !== (int) $pid) {
+        update_option('wp_chess_page_id', (int) $pid);
+    }
+
     $local_file = WP_CHESS_PLUGIN_DIR . 'app/index.html';
-    $has_local_file = file_exists($local_file) && filesize($local_file) > 1000;
-    if ($has_local_file) {
-        $default_url = plugins_url('app/index.html?v=' . WP_CHESS_VERSION . '&t=' . time(), __FILE__);
+    if (file_exists($local_file) && filesize($local_file) > 1000) {
+        $default_url = plugins_url('app/index.html?v=' . WP_CHESS_VERSION, __FILE__);
     } else {
-        $default_url = add_query_arg(array('wp_chess_embed' => '1', 'v' => WP_CHESS_VERSION, 't' => time()), home_url('/'));
+        $default_url = add_query_arg(array('wp_chess_embed' => '1', 'v' => WP_CHESS_VERSION), home_url('/'));
     }
 
     $attributes = shortcode_atts(array(
@@ -677,534 +687,388 @@ function wp_chess_game_shortcode($atts) {
     $height = esc_attr($attributes['height']);
     $radius = esc_attr($attributes['border_radius']);
 
-    $price_text = get_option('wp_chess_price_text', '79 ₴');
-    $daily_hints = get_option('wp_chess_daily_hints', 10);
-    $paypal_url = get_option('wp_chess_paypal_url', 'https://www.paypal.com/checkout?amount=1.99');
-    $card_url = get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-    $test_mode = (get_option('wp_chess_test_mode', '0') === '1');
-    $api_url = rest_url('chess/v1');
-
-    // Перевірка статусу користувача для шорткоду
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-    $current_uid = get_current_user_id();
-    $wp_u = $current_uid > 0 ? wp_get_current_user() : null;
-    $has_wcc = function_exists('wcc_check_user_premium');
-    $is_user_premium = false;
-    $is_explicitly_blocked = false;
-
-    // 1. Доменний PRO через UA Pay Box:
-    if (chess_is_pro()) {
-        $is_user_premium = true;
-    }
-    // 2. UA Pay Box / WCC перевірка за ID проекту 3:
-    elseif ($current_uid > 0 && $has_wcc) {
-        if (wcc_check_user_premium($current_uid, 3)) {
-            $is_user_premium = true;
-        } else {
-            $is_user_premium = false;
-            $is_explicitly_blocked = false;
-        }
-    }
-    // 3. Локальна таблиця шахістів:
-    elseif ($current_uid > 0 && $wp_u && !empty($wp_u->user_email)) {
-        $db_status = $wpdb->get_var($wpdb->prepare("SELECT status FROM $table_name WHERE email = %s", $wp_u->user_email));
-        if ($db_status === 'PRO') {
-            $is_user_premium = true;
-        } elseif ($db_status === 'FREE') {
-            $is_user_premium = false;
-            $is_explicitly_blocked = false;
-        }
-    }
-
-    // 4. Адміністратор сайту або тестовий режим:
-    if (current_user_can('manage_options') || $test_mode || ($wp_u && $wp_u->user_email === 'portall.mail@gmail.com')) {
-        $is_user_premium = true;
-        $is_explicitly_blocked = false;
-    }
-
-    $buy_button_html = '';
-    if (shortcode_exists('universal_pay_box')) {
-        $buy_button_html = do_shortcode('[universal_pay_box id="3"]');
-    } elseif (class_exists('UM_Helpers') && method_exists('UM_Helpers', 'buy_button')) {
-        $buy_button_html = UM_Helpers::buy_button(3, 'Купити PRO');
-    } else {
-        $buy_button_html = '<button data-upb-buy="3" class="button button-primary">Купити PRO</button>';
-    }
-
-    // Реальна статистика гравців та онлайн-сесій на сайті
-    $online_players = wp_chess_record_session_ping();
-    $total_players = (int)$wpdb->get_var("SELECT COUNT(*) FROM $table_name");
-    $total_games_db = (int)$wpdb->get_var("SELECT COALESCE(SUM(games_played), 0) FROM $table_name");
-    $total_games_opt = (int)get_option('wp_chess_total_games_count', 0);
-    $total_games = max($total_games_db, $total_games_opt);
-    $page_url = get_permalink() ? get_permalink() : home_url('/chess/');
-    $icon_url = esc_url(plugins_url('app/pwa-192x192.png', __FILE__));
-
-    $config_json = json_encode(array(
-        'pageUrl' => $page_url,
-        'appUrl' => esc_url($app_url),
-        'iconUrl' => $icon_url,
-        'priceText' => $price_text,
-        'dailyHints' => intval($daily_hints),
-        'paypalUrl' => $paypal_url,
-        'cardUrl' => $card_url,
-        'testMode' => $test_mode,
-        'apiUrl' => $api_url,
-        'hasMonetizationPlugin' => $has_wcc,
-        'isUserPremium' => $is_user_premium,
-        'isBlocked' => $is_explicitly_blocked,
-        'userId' => intval($current_uid),
-        'userEmail' => ($wp_u && !empty($wp_u->user_email)) ? $wp_u->user_email : '',
-        'userName' => ($wp_u && !empty($wp_u->display_name)) ? $wp_u->display_name : '',
-        'buyButtonHtml' => $buy_button_html,
-        'totalPlayers' => max(1, $total_players),
-        'totalGames' => $total_games,
-        'onlinePlayers' => max(1, $online_players),
-    ));
+    $config = wp_chess_build_config();
+    $config['appUrl'] = $app_url;
 
     $html = '<!-- UAServer WP Chess Platform PWA v' . WP_CHESS_VERSION . ' -->';
     $html .= '<script>
-      window.WP_CHESS_CONFIG = ' . $config_json . ';
+      window.WP_CHESS_CONFIG = ' . wp_json_encode($config) . ';
       var wpChessDeferredPrompt = null;
-      window.addEventListener("beforeinstallprompt", function(e) {
-        e.preventDefault();
-        wpChessDeferredPrompt = e;
-        var f = document.getElementById("wp-chess-frame");
-        if (f && f.contentWindow) {
-          f.contentWindow.postMessage({ type: "WP_CHESS_CAN_INSTALL" }, "*");
-        }
-      });
-      window.addEventListener("appinstalled", function() {
-        wpChessDeferredPrompt = null;
-        var f = document.getElementById("wp-chess-frame");
-        if (f && f.contentWindow) {
-          f.contentWindow.postMessage({ type: "WP_CHESS_INSTALLED" }, "*");
-        }
-      });
+      function wpChessPost(t) { var f = document.getElementById("wp-chess-frame"); if (f && f.contentWindow) { f.contentWindow.postMessage({ type: t }, "*"); } }
+      window.addEventListener("beforeinstallprompt", function(e) { e.preventDefault(); wpChessDeferredPrompt = e; wpChessPost("WP_CHESS_CAN_INSTALL"); });
+      window.addEventListener("appinstalled", function() { wpChessDeferredPrompt = null; wpChessPost("WP_CHESS_INSTALLED"); });
       window.addEventListener("message", function(e) {
         if (!e.data) return;
         var f = document.getElementById("wp-chess-frame");
         if (e.data.type === "WP_CHESS_GET_CONFIG") {
-          if (f && f.contentWindow) {
-            f.contentWindow.postMessage({ type: "WP_CHESS_CONFIG_RESPONSE", config: window.WP_CHESS_CONFIG }, "*");
-          }
+          if (f && f.contentWindow) { f.contentWindow.postMessage({ type: "WP_CHESS_CONFIG_RESPONSE", config: window.WP_CHESS_CONFIG }, "*"); }
         } else if (e.data.type === "WP_CHESS_CHECK_INSTALL") {
-          if (wpChessDeferredPrompt && f && f.contentWindow) {
-            f.contentWindow.postMessage({ type: "WP_CHESS_CAN_INSTALL" }, "*");
-          }
+          if (wpChessDeferredPrompt) { wpChessPost("WP_CHESS_CAN_INSTALL"); }
         } else if (e.data.type === "WP_CHESS_TRIGGER_INSTALL") {
           if (wpChessDeferredPrompt) {
             wpChessDeferredPrompt.prompt().then(function(choice) {
-              if (choice && choice.outcome === "accepted") {
-                wpChessDeferredPrompt = null;
-                if (f && f.contentWindow) {
-                  f.contentWindow.postMessage({ type: "WP_CHESS_INSTALLED" }, "*");
-                }
-              }
+              if (choice && choice.outcome === "accepted") { wpChessDeferredPrompt = null; wpChessPost("WP_CHESS_INSTALLED"); }
             });
           }
         }
       });
     </script>';
     $html .= '<div class="wp-chess-game-container" style="width:100%; max-width:1200px; margin:0 auto; clear:both; position:relative;">';
-    $html .= '<iframe ';
-    $html .= 'id="wp-chess-frame" ';
-    // Завантажуємо гру безпосередньо через src, без srcdoc, щоб уникнути помилок відносних шляхів та чорного екрану
-    $html .= 'src="' . esc_url($app_url) . '" ';
-    $html .= 'title="Шахи проти ШІ" ';
-    $html .= 'width="100%" ';
-    $html .= 'height="' . $height . '" ';
+    $html .= '<iframe id="wp-chess-frame" src="' . $app_url . '" title="Шахи проти ШІ" width="100%" height="' . $height . '" ';
     $html .= 'style="width:100%; height:' . $height . '; min-height:680px; border:none; border-radius:' . $radius . '; background:#020617; display:block; box-shadow:0 15px 35px rgba(0,0,0,0.3);" ';
-    $html .= 'allow="fullscreen; autoplay; clipboard-write" ';
-    $html .= 'loading="eager" ';
-    $html .= 'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" ';
-    $html .= '></iframe>';
+    $html .= 'allow="fullscreen; autoplay; clipboard-write" loading="eager" ';
+    $html .= 'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals"></iframe>';
     $html .= '</div>';
 
     return $html;
 }
 add_shortcode('wp_chess_pwa', 'wp_chess_game_shortcode');
 
-/**
- * 8. Шорткод 2: [wp_chess_pwa_guide] (Інструкція «Як грати»)
- */
 function wp_chess_guide_shortcode($atts) {
     $guide = get_option('wp_chess_guide_content', wp_chess_get_default_guide_content());
-
     $output = '<div class="wp-chess-guide-box" style="background:#0f172a; color:#e2e8f0; border:1px solid #1e293b; border-radius:16px; padding:28px; margin:20px 0; font-size:15px; line-height:1.7; box-shadow:0 10px 25px rgba(0,0,0,0.2);">';
     $output .= wp_kses_post($guide);
     $output .= '</div>';
-
     return $output;
 }
 add_shortcode('wp_chess_pwa_guide', 'wp_chess_guide_shortcode');
 
 /**
- * 8.1. Впровадження PWA-метаданих у заголовок сторінки сайту
+ * 8. PWA: власний маніфест і service worker ТІЛЬКИ на сторінці з грою.
+ * Раніше маніфест із шляхами «/pwa-192x192.png» підключався на всіх сторінках
+ * і конфліктував з іконками інших плагінів.
  */
+function wp_chess_is_chess_page() {
+    if (!is_singular()) {
+        return false;
+    }
+    $post = get_queried_object();
+    if (!($post instanceof WP_Post)) {
+        return false;
+    }
+    if ((int) get_option('wp_chess_page_id', 0) === (int) $post->ID) {
+        return true;
+    }
+    if (has_shortcode($post->post_content, 'wp_chess_pwa')) {
+        return true;
+    }
+    $el = get_post_meta($post->ID, '_elementor_data', true);
+    return is_string($el) && strpos($el, 'wp_chess_pwa') !== false;
+}
+
+function wp_chess_page_scope($start) {
+    $u = wp_parse_url($start);
+    $path = isset($u['path']) ? $u['path'] : '/';
+    if (substr($path, -1) !== '/') {
+        $path = trailingslashit(dirname($path));
+    }
+    $port = isset($u['port']) ? ':' . $u['port'] : '';
+    return $u['scheme'] . '://' . $u['host'] . $port . $path;
+}
+
 function wp_chess_inject_pwa_head() {
-    $plugin_app_url = esc_url(plugins_url('app/', __FILE__));
-    echo "\n" . '<!-- WP Chess PWA Meta -->' . "\n";
-    echo '<link rel="manifest" href="' . $plugin_app_url . 'manifest.webmanifest">' . "\n";
+    if (!wp_chess_is_chess_page()) {
+        return;
+    }
+    $post_id = (int) get_queried_object_id();
+    $manifest = add_query_arg(array('wp_chess_manifest' => '1', 'p' => $post_id), home_url('/'));
+    $sw = add_query_arg('wp_chess_sw', '1', home_url('/'));
+    $scope = wp_chess_page_scope(get_permalink($post_id));
+    $icon = plugins_url('app/pwa-192x192.png', __FILE__);
+    echo "\n<!-- WP Chess PWA -->\n";
+    echo '<link rel="manifest" id="wp-chess-manifest" href="' . esc_url($manifest) . '">' . "\n";
     echo '<meta name="theme-color" content="#020617">' . "\n";
     echo '<meta name="mobile-web-app-capable" content="yes">' . "\n";
     echo '<meta name="apple-mobile-web-app-capable" content="yes">' . "\n";
     echo '<meta name="apple-mobile-web-app-title" content="Шахи проти ШІ">' . "\n";
-    echo '<link rel="apple-touch-icon" sizes="192x192" href="' . $plugin_app_url . 'pwa-192x192.png">' . "\n";
+    echo '<link rel="apple-touch-icon" sizes="192x192" href="' . esc_url($icon) . '">' . "\n";
+    echo '<script>
+document.addEventListener("DOMContentLoaded", function () {
+  document.querySelectorAll(\'link[rel="manifest"]\').forEach(function (l) { if (l.id !== "wp-chess-manifest") { l.parentNode.removeChild(l); } });
+  document.querySelectorAll(\'link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]\').forEach(function (l) { if (l.href !== ' . wp_json_encode($icon) . ') { l.parentNode.removeChild(l); } });
+});
+if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register(' . wp_json_encode($sw) . ', { scope: ' . wp_json_encode(wp_parse_url($scope, PHP_URL_PATH)) . ' }).catch(function () {}); }); }
+</script>' . "\n";
 }
-add_action('wp_head', 'wp_chess_inject_pwa_head');
+add_action('wp_head', 'wp_chess_inject_pwa_head', 1);
+
+function wp_chess_serve_pwa_files() {
+    if (isset($_GET['wp_chess_manifest'])) {
+        $pid = isset($_GET['p']) ? absint($_GET['p']) : (int) get_option('wp_chess_page_id', 0);
+        $start = $pid ? get_permalink($pid) : '';
+        if (!$start) {
+            $start = home_url('/');
+        }
+        $icons = plugins_url('app/', __FILE__);
+        $manifest = array(
+            'id'               => $start,
+            'name'             => 'Шахи проти ШІ',
+            'short_name'       => 'Шахи ШІ',
+            'description'      => 'Шахова платформа з 8 дизайнами дошки та ШІ-тренером.',
+            'start_url'        => $start,
+            'scope'            => wp_chess_page_scope($start),
+            'display'          => 'standalone',
+            'background_color' => '#0f172a',
+            'theme_color'      => '#020617',
+            'lang'             => 'uk',
+            'icons'            => array(
+                array('src' => $icons . 'pwa-192x192.png', 'sizes' => '192x192', 'type' => 'image/png', 'purpose' => 'any'),
+                array('src' => $icons . 'pwa-512x512.png', 'sizes' => '512x512', 'type' => 'image/png', 'purpose' => 'any'),
+                array('src' => $icons . 'pwa-maskable-512x512.png', 'sizes' => '512x512', 'type' => 'image/png', 'purpose' => 'maskable'),
+            ),
+        );
+        header('Content-Type: application/manifest+json; charset=UTF-8');
+        header('Cache-Control: public, max-age=3600');
+        echo wp_json_encode($manifest);
+        exit;
+    }
+    if (isset($_GET['wp_chess_sw'])) {
+        header('Content-Type: application/javascript; charset=UTF-8');
+        header('Service-Worker-Allowed: /');
+        header('Cache-Control: no-cache');
+        echo "self.addEventListener('install',function(){self.skipWaiting();});self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim());});self.addEventListener('fetch',function(){});";
+        exit;
+    }
+}
+add_action('init', 'wp_chess_serve_pwa_files', 1);
 
 /**
- * 9. REST API для реєстрації, входу та отримання PRO
+ * 9. REST API
  */
 function wp_chess_register_rest_routes() {
-    register_rest_route('chess/v1', '/register', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_register',
-        'permission_callback' => '__return_true',
-    ));
-
-    register_rest_route('chess/v1', '/login', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_login',
-        'permission_callback' => '__return_true',
-    ));
-
-    register_rest_route('chess/v1', '/status', array(
-        'methods' => array('GET', 'POST'),
-        'callback' => 'wp_chess_api_status',
-        'permission_callback' => '__return_true',
-    ));
-
-    // Миттєва активація PRO при переході на Приват-Конверт
-    register_rest_route('chess/v1', '/instant-pro', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_instant_pro',
-        'permission_callback' => '__return_true',
-    ));
-
-    // Інтеграція UA Pay Box: миттєва активація PRO та отримання посилання на оплату
-    register_rest_route('chess/v1', '/activate-pro', array(
-        'methods' => array('GET', 'POST'),
-        'callback' => 'wp_chess_api_activate_pro',
-        'permission_callback' => '__return_true',
-    ));
-
-    register_rest_route('chess/v1', '/payment-webhook', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_payment_webhook',
-        'permission_callback' => '__return_true',
-    ));
-
-    // Реальна статистика: лічильник гравців та активних онлайн-сесій
-    register_rest_route('chess/v1', '/stats', array(
-        'methods' => array('GET', 'POST'),
-        'callback' => 'wp_chess_api_stats',
-        'permission_callback' => '__return_true',
-    ));
-
-    register_rest_route('chess/v1', '/heartbeat', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_heartbeat',
-        'permission_callback' => '__return_true',
-    ));
-
-    register_rest_route('chess/v1', '/record-game', array(
-        'methods' => 'POST',
-        'callback' => 'wp_chess_api_record_game',
-        'permission_callback' => '__return_true',
-    ));
+    $routes = array(
+        'register'     => array('POST', 'wp_chess_api_register'),
+        'login'        => array('POST', 'wp_chess_api_login'),
+        'logout'       => array('POST', 'wp_chess_api_logout'),
+        'status'       => array(array('GET', 'POST'), 'wp_chess_api_status'),
+        'instant-pro'  => array('POST', 'wp_chess_api_activate_pro'),
+        'activate-pro' => array('POST', 'wp_chess_api_activate_pro'),
+        'stats'        => array(array('GET', 'POST'), 'wp_chess_api_stats'),
+        'heartbeat'    => array('POST', 'wp_chess_api_heartbeat'),
+        'record-game'  => array('POST', 'wp_chess_api_record_game'),
+    );
+    foreach ($routes as $path => $r) {
+        register_rest_route('chess/v1', '/' . $path, array(
+            'methods' => $r[0],
+            'callback' => $r[1],
+            'permission_callback' => '__return_true',
+        ));
+    }
 }
 add_action('rest_api_init', 'wp_chess_register_rest_routes');
 
+function wp_chess_json_params($request) {
+    $p = $request->get_json_params();
+    if (!is_array($p)) {
+        $p = $request->get_params();
+    }
+    return is_array($p) ? $p : array();
+}
+
+function wp_chess_error($message, $code = 400) {
+    return new WP_REST_Response(array('success' => false, 'message' => $message), $code);
+}
+
+function wp_chess_login_wp_user($uid) {
+    if ($uid > 0 && !headers_sent()) {
+        wp_set_current_user($uid);
+        wp_set_auth_cookie($uid, true);
+    }
+}
+
+// Унікальний логін WordPress із пошти (нік гравця може бути кирилицею — він іде в display_name)
+function wp_chess_unique_login($email) {
+    $base = sanitize_user(current(explode('@', $email)), true);
+    $base = substr($base, 0, 50);
+    if (strlen($base) < 3) {
+        $base = 'chess' . wp_rand(1000, 9999);
+    }
+    $login = $base;
+    $i = 1;
+    while (username_exists($login)) {
+        $login = $base . ($i <= 50 ? $i : wp_rand(1000, 99999));
+        $i++;
+    }
+    return $login;
+}
+
+function wp_chess_create_wp_user($email, $password, $name) {
+    $uid = wp_insert_user(array(
+        'user_login'           => wp_chess_unique_login($email),
+        'user_pass'            => $password,
+        'user_email'           => $email,
+        'display_name'         => $name,
+        'nickname'             => $name,
+        'role'                 => 'chess_player',
+        'show_admin_bar_front' => 'false',
+    ));
+    return $uid;
+}
+
+function wp_chess_user_payload($row, $is_pro) {
+    return array(
+        'id'        => (string) $row->id,
+        'name'      => $row->username,
+        'email'     => $row->email,
+        'isPremium' => (bool) $is_pro,
+        'stats'     => array(
+            'gamesPlayed' => (int) $row->games_played,
+            'wins'        => (int) $row->wins,
+            'losses'      => max(0, (int) $row->games_played - (int) $row->wins),
+            'draws'       => 0,
+        ),
+    );
+}
+
 function wp_chess_api_register($request) {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
+    $table_name = wp_chess_table();
+    $p = wp_chess_json_params($request);
 
-    $params = $request->get_json_params();
-    $username = sanitize_user($params['username'] ?? '', true);
-    $email = sanitize_email($params['email'] ?? '');
-    $password = $params['password'] ?? '';
+    $name = trim(wp_strip_all_tags((string) ($p['username'] ?? '')));
+    $name = function_exists('mb_substr') ? mb_substr($name, 0, 60) : substr($name, 0, 60);
+    $email = sanitize_email(strtolower(trim((string) ($p['email'] ?? ''))));
+    $password = (string) ($p['password'] ?? '');
 
-    if (empty($username) || empty($email) || empty($password)) {
-        return new WP_REST_Response(array('success' => false, 'message' => 'Всі поля обов’язкові для заповнення'), 400);
+    if ($name === '' || $email === '' || $password === '') {
+        return wp_chess_error('Всі поля обов’язкові для заповнення');
     }
-
     if (!is_email($email)) {
-        return new WP_REST_Response(array('success' => false, 'message' => 'Некоректний формат email адреси'), 400);
+        return wp_chess_error('Некоректний формат email адреси');
+    }
+    if (strlen($password) < 6) {
+        return wp_chess_error('Пароль має містити щонайменше 6 символів');
     }
 
-    // 1. Інтеграція з користувачами сайту WordPress (роль «Шахіст»)
-    $wp_user_by_email = get_user_by('email', $email);
-    $wp_user_by_login = get_user_by('login', $username);
+    $wp_user = get_user_by('email', $email);
+    $row = wp_chess_get_player($email);
+    $exists_msg = 'Користувач з такою поштою вже зареєстрований. Увійдіть у вкладці «Вхід» або скористайтеся «Забули пароль?»';
 
-    if ($wp_user_by_email && $wp_user_by_login && $wp_user_by_email->ID !== $wp_user_by_login->ID) {
-        return new WP_REST_Response(array('success' => false, 'message' => 'Користувач з такою поштою або логіном уже зареєстрований'), 400);
-    }
-
-    $wp_uid = 0;
-    if ($wp_user_by_email) {
-        $wp_uid = $wp_user_by_email->ID;
-        if (!wp_check_password($password, $wp_user_by_email->user_pass, $wp_uid)) {
-            return new WP_REST_Response(array('success' => false, 'message' => 'Користувач з такою поштою вже існує. Будь ласка, введіть вірний пароль у вкладці «Вхід»'), 400);
+    if ($wp_user) {
+        if (!wp_check_password($password, $wp_user->user_pass, $wp_user->ID)) {
+            return wp_chess_error($exists_msg);
         }
-    } elseif ($wp_user_by_login) {
-        $wp_uid = $wp_user_by_login->ID;
-        if (!wp_check_password($password, $wp_user_by_login->user_pass, $wp_uid)) {
-            return new WP_REST_Response(array('success' => false, 'message' => 'Користувач з таким логіном вже існує. Будь ласка, оберіть інший логін'), 400);
+        $uid = $wp_user->ID;
+        if (empty($wp_user->roles)) {
+            $wp_user->set_role('chess_player');
         }
     } else {
-        // Створюємо нового користувача в WordPress з роллю «Шахіст»
-        $wp_uid = wp_create_user($username, $password, $email);
-        if (is_wp_error($wp_uid)) {
-            return new WP_REST_Response(array('success' => false, 'message' => $wp_uid->get_error_message()), 400);
+        // Старий запис без акаунта WP: дозволяємо лише за правильним паролем або якщо це «заглушка» оплати
+        if ($row && !wp_check_password($password, $row->password_hash) && !wp_check_password('chess_player', $row->password_hash)) {
+            return wp_chess_error($exists_msg);
         }
-        $wp_user = new WP_User($wp_uid);
-        $wp_user->set_role('chess_player');
-        wp_update_user(array('ID' => $wp_uid, 'display_name' => $username));
+        $uid = wp_chess_create_wp_user($email, $password, $name);
+        if (is_wp_error($uid)) {
+            return wp_chess_error($uid->get_error_message());
+        }
     }
 
-    // 2. Додавання та синхронізація в автономну базу шахістів плагіна ($wpdb->prefix . 'chess_players')
-    $existing = $wpdb->get_row($wpdb->prepare("SELECT id, status, games_played, wins FROM $table_name WHERE email = %s", $email));
-    $status = 'FREE'; // Нові користувачі завжди починають як FREE
-    $player_id = 0;
-    $games_played = 0;
-    $wins = 0;
-
-    if ($existing) {
-        $player_id = $existing->id;
-        $status = $existing->status;
-        $games_played = (int)$existing->games_played;
-        $wins = (int)$existing->wins;
-        $wpdb->update($table_name, array('username' => $username), array('id' => $player_id));
+    if ($row) {
+        $wpdb->update($table_name, array('username' => $name, 'password_hash' => wp_hash_password($password)), array('id' => $row->id));
     } else {
-        $hash = wp_hash_password($password);
-        $wpdb->insert($table_name, array(
-            'username' => $username,
-            'email' => $email,
-            'password_hash' => $hash,
-            'status' => 'FREE',
+        $ok = $wpdb->insert($table_name, array(
+            'username'      => $name,
+            'email'         => $email,
+            'password_hash' => wp_hash_password($password),
+            'status'        => 'FREE',
             'registered_at' => current_time('mysql'),
-            'games_played' => 0,
-            'wins' => 0,
         ));
-        $player_id = $wpdb->insert_id;
+        if (!$ok) {
+            return wp_chess_error('Не вдалося зберегти гравця в базі. Спробуйте ще раз.', 500);
+        }
     }
-
-    // Перевірка наявності PRO
-    $is_pro = false;
-    if ($status === 'PRO') {
-        $is_pro = true;
-    } elseif ($wp_uid > 0 && user_can($wp_uid, 'manage_options')) {
-        $is_pro = true;
-    } elseif (chess_is_pro()) {
-        $is_pro = true;
-    } elseif ($wp_uid > 0 && function_exists('wcc_check_user_premium') && wcc_check_user_premium($wp_uid, 3)) {
-        $is_pro = true;
-    }
+    $row = wp_chess_get_player($email);
+    wp_chess_login_wp_user($uid);
 
     return new WP_REST_Response(array(
         'success' => true,
-        'user' => array(
-            'id' => (string)($player_id ?: $wp_uid),
-            'name' => $username,
-            'email' => $email,
-            'isPremium' => $is_pro,
-            'stats' => array(
-                'gamesPlayed' => $games_played,
-                'wins' => $wins,
-                'losses' => 0,
-                'draws' => 0,
-            )
-        ),
-        'message' => 'Користувача успішно зареєстровано в WordPress (роль «Шахіст») та в базі шахістів.',
+        'user'    => wp_chess_user_payload($row, wp_chess_is_pro_email($email)),
+        'message' => 'Гравця зареєстровано (роль «Шахіст»).',
     ), 200);
 }
 
 function wp_chess_api_login($request) {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
+    $table_name = wp_chess_table();
+    $p = wp_chess_json_params($request);
 
-    $params = $request->get_json_params();
-    $login_input = sanitize_text_field($params['email'] ?? $params['username'] ?? '');
-    $password = $params['password'] ?? '';
-
-    if (empty($login_input) || empty($password)) {
-        return new WP_REST_Response(array('success' => false, 'message' => 'Введіть логін/email та пароль'), 400);
+    $ident = trim((string) ($p['email'] ?? $p['username'] ?? ''));
+    $password = (string) ($p['password'] ?? '');
+    if ($ident === '' || $password === '') {
+        return wp_chess_error('Введіть логін/email та пароль');
     }
 
-    $wp_user = null;
-    if (is_email($login_input)) {
-        $wp_user = get_user_by('email', $login_input);
-    }
+    $wp_user = is_email($ident) ? get_user_by('email', $ident) : get_user_by('login', $ident);
+    $row = null;
     if (!$wp_user) {
-        $wp_user = get_user_by('login', $login_input);
+        $row = is_email($ident)
+            ? wp_chess_get_player($ident)
+            : $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE username = %s ORDER BY id ASC LIMIT 1", $ident));
+        if ($row) {
+            $wp_user = get_user_by('email', $row->email);
+        }
     }
 
-    $player_record = null;
-    $authenticated = false;
+    $fail = wp_chess_error('Невірний логін/email або пароль', 403);
 
-    if ($wp_user && wp_check_password($password, $wp_user->user_pass, $wp_user->ID)) {
-        $authenticated = true;
-        // Синхронізуємо з таблицею chess_players якщо ще немає
-        $player_record = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE email = %s", $wp_user->user_email));
-        if (!$player_record) {
-            $is_admin = user_can($wp_user->ID, 'manage_options');
-            $wpdb->insert($table_name, array(
-                'username' => $wp_user->display_name ?: $wp_user->user_login,
-                'email' => $wp_user->user_email,
-                'password_hash' => $wp_user->user_pass,
-                'status' => $is_admin ? 'PRO' : 'FREE',
-                'registered_at' => current_time('mysql'),
-            ));
-            $player_record = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE id = %d", $wpdb->insert_id));
+    if ($wp_user) {
+        if (!wp_check_password($password, $wp_user->user_pass, $wp_user->ID)) {
+            return $fail;
         }
+        $email = strtolower($wp_user->user_email);
+        $row = wp_chess_ensure_player($email);
+        $uid = $wp_user->ID;
     } else {
-        // Перевіряємо в автономній базі шахістів
-        if (is_email($login_input)) {
-            $player_record = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE email = %s", $login_input));
-        } else {
-            $player_record = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE username = %s", $login_input));
+        // Гравець зі старої бази без акаунта WordPress — створюємо акаунт при першому вході
+        if (!$row || wp_check_password('chess_player', $row->password_hash) || !wp_check_password($password, $row->password_hash)) {
+            return $fail;
         }
-        if ($player_record && wp_check_password($password, $player_record->password_hash)) {
-            $authenticated = true;
+        $uid = wp_chess_create_wp_user(strtolower($row->email), $password, $row->username);
+        if (is_wp_error($uid)) {
+            return wp_chess_error($uid->get_error_message());
         }
+        $email = strtolower($row->email);
     }
-
-    if (!$authenticated || !$player_record) {
-        return new WP_REST_Response(array('success' => false, 'message' => 'Невірний логін/email або пароль'), 403);
+    if (!$row) {
+        return $fail;
     }
-
-    // Визначаємо статус PRO
-    $is_pro = false;
-    if ($player_record->status === 'PRO') {
-        $is_pro = true;
-    } elseif ($wp_user && user_can($wp_user->ID, 'manage_options')) {
-        $is_pro = true;
-    } elseif (chess_is_pro()) {
-        $is_pro = true;
-    } elseif ($wp_user && function_exists('wcc_check_user_premium') && wcc_check_user_premium($wp_user->ID, 3)) {
-        $is_pro = true;
-    }
+    wp_chess_login_wp_user($uid);
 
     return new WP_REST_Response(array(
         'success' => true,
-        'user' => array(
-            'id' => (string)$player_record->id,
-            'name' => $player_record->username,
-            'email' => $player_record->email,
-            'isPremium' => $is_pro,
-            'stats' => array(
-                'gamesPlayed' => (int)$player_record->games_played,
-                'wins' => (int)$player_record->wins,
-                'losses' => 0,
-                'draws' => 0,
-            )
-        )
+        'user'    => wp_chess_user_payload($row, wp_chess_is_pro_email($email)),
     ), 200);
 }
 
+function wp_chess_api_logout($request) {
+    wp_clear_auth_cookie();
+    wp_set_current_user(0);
+    return new WP_REST_Response(array('success' => true), 200);
+}
 
 function wp_chess_api_status($request) {
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-
-    $email = sanitize_email($request->get_param('email') ?? '');
-    $user_id = absint($request->get_param('user_id') ?? 0);
-
-    $wp_uid = get_current_user_id();
-    if (!$wp_uid && !empty($email)) {
-        $wp_u = get_user_by('email', $email);
-        if ($wp_u) {
-            $wp_uid = $wp_u->ID;
-        }
+    $email = sanitize_email(strtolower(trim((string) $request->get_param('email'))));
+    if ($email === '') {
+        return new WP_REST_Response(array('success' => true, 'isPremium' => false, 'status' => 'FREE', 'isBlocked' => false), 200);
     }
-
-    // 0. Доменний PRO через UA Pay Box:
-    if (chess_is_pro()) {
-        return new WP_REST_Response(array(
-            'success' => true,
-            'isPremium' => true,
-            'status' => 'PRO',
-            'isBlocked' => false,
-            'source' => 'ua_pay_box_domain'
-        ), 200);
-    }
-
-    // Перевірка прав адміністратора або тестового режиму
-    if (current_user_can('manage_options') || $email === 'portall.mail@gmail.com' || (get_option('wp_chess_test_mode', '0') === '1')) {
-        return new WP_REST_Response(array(
-            'success' => true,
-            'isPremium' => true,
-            'status' => 'PRO',
-            'isBlocked' => false,
-            'source' => 'admin_access'
-        ), 200);
-    }
-
-    // 1. ГОЛОВНИЙ ПРІОРИТЕТ: Окремий плагін монетизації користувача (проект Шахи PRO пожиттєвий, ID 3)
-    if (function_exists('wcc_check_user_premium')) {
-        $check_id = $wp_uid > 0 ? $wp_uid : $user_id;
-        if ($check_id > 0) {
-            $is_pro = (bool) wcc_check_user_premium($check_id, 3);
-            return new WP_REST_Response(array(
-                'success' => true,
-                'isPremium' => $is_pro,
-                'status' => $is_pro ? 'PRO' : 'FREE',
-                'isBlocked' => false,
-                'source' => 'wcc_monetization_plugin'
-            ), 200);
-        }
-    }
-
-    // 2. Локальна перевірка таблиці гравців
-    if (!empty($email)) {
-        $player = $wpdb->get_row($wpdb->prepare("SELECT id, username, email, status FROM $table_name WHERE email = %s", $email));
-        if ($player) {
-            $is_pro = ($player->status === 'PRO');
-            return new WP_REST_Response(array(
-                'success' => true,
-                'id' => $player->id,
-                'email' => $player->email,
-                'isPremium' => $is_pro,
-                'status' => $player->status,
-                'isBlocked' => false,
-            ), 200);
-        }
-    } elseif ($user_id > 0) {
-        $player = $wpdb->get_row($wpdb->prepare("SELECT id, username, email, status FROM $table_name WHERE id = %d", $user_id));
-        if ($player) {
-            $is_pro = ($player->status === 'PRO');
-            return new WP_REST_Response(array(
-                'success' => true,
-                'id' => $player->id,
-                'email' => $player->email,
-                'isPremium' => $is_pro,
-                'status' => $player->status,
-                'isBlocked' => false,
-            ), 200);
-        }
-    }
-
+    $is_pro = wp_chess_is_pro_email($email);
     return new WP_REST_Response(array(
-        'success' => true,
-        'isPremium' => false,
-        'status' => 'FREE',
-        'isBlocked' => false
+        'success'   => true,
+        'isPremium' => $is_pro,
+        'status'    => $is_pro ? 'PRO' : 'FREE',
+        'isBlocked' => false,
     ), 200);
 }
 
 /**
- * 10. Реальний облік онлайн гравців та статистики партій (без фіктивних цифр)
+ * 10. Реальний облік онлайн гравців та статистики партій
  */
 function wp_chess_get_online_players_count() {
     $active = get_transient('wp_chess_active_sessions');
     if (!is_array($active)) {
         $active = array();
     }
-    $now = time();
-    $cutoff = $now - 300; // 5 хвилин
+    $cutoff = time() - 300;
     $changed = false;
     foreach ($active as $sid => $last_seen) {
         if ($last_seen < $cutoff) {
@@ -1242,43 +1106,34 @@ function wp_chess_record_session_ping($session_id = '') {
 
 function wp_chess_api_stats($request) {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-
-    $params = $request->get_json_params();
-    $sid = sanitize_text_field($params['sessionId'] ?? '');
-    $online_count = wp_chess_record_session_ping($sid);
-
-    $total_players = (int)$wpdb->get_var("SELECT COUNT(*) FROM $table_name");
-    $total_games_db = (int)$wpdb->get_var("SELECT COALESCE(SUM(games_played), 0) FROM $table_name");
-    $total_games_opt = (int)get_option('wp_chess_total_games_count', 0);
-    $total_games = max($total_games_db, $total_games_opt);
-
+    $table_name = wp_chess_table();
+    $p = wp_chess_json_params($request);
+    $online_count = wp_chess_record_session_ping(sanitize_text_field($p['sessionId'] ?? ''));
+    $total_games = max((int) $wpdb->get_var("SELECT COALESCE(SUM(games_played), 0) FROM $table_name"), (int) get_option('wp_chess_total_games_count', 0));
     return new WP_REST_Response(array(
-        'success' => true,
-        'totalPlayers' => max(1, $total_players),
+        'success'       => true,
+        'totalPlayers'  => max(1, (int) $wpdb->get_var("SELECT COUNT(*) FROM $table_name")),
         'onlinePlayers' => $online_count,
-        'totalGames' => $total_games,
+        'totalGames'    => $total_games,
     ), 200);
 }
 
 function wp_chess_api_heartbeat($request) {
-    $params = $request->get_json_params();
-    $sid = sanitize_text_field($params['sessionId'] ?? '');
-    $online_count = wp_chess_record_session_ping($sid);
+    $p = wp_chess_json_params($request);
     return new WP_REST_Response(array(
-        'success' => true,
-        'onlinePlayers' => $online_count,
+        'success'       => true,
+        'onlinePlayers' => wp_chess_record_session_ping(sanitize_text_field($p['sessionId'] ?? '')),
     ), 200);
 }
 
 function wp_chess_api_record_game($request) {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-    $params = $request->get_json_params();
-    $email = sanitize_email($params['email'] ?? '');
-    $outcome = sanitize_text_field($params['outcome'] ?? '');
+    $table_name = wp_chess_table();
+    $p = wp_chess_json_params($request);
+    $email = sanitize_email(strtolower(trim((string) ($p['email'] ?? ''))));
+    $outcome = sanitize_text_field($p['outcome'] ?? '');
 
-    if (!empty($email)) {
+    if ($email !== '' && wp_chess_ensure_player($email)) {
         if ($outcome === 'win') {
             $wpdb->query($wpdb->prepare("UPDATE $table_name SET games_played = games_played + 1, wins = wins + 1 WHERE email = %s", $email));
         } else {
@@ -1286,161 +1141,39 @@ function wp_chess_api_record_game($request) {
         }
     }
 
-    $cnt = (int)get_option('wp_chess_total_games_count', 0) + 1;
+    $cnt = (int) get_option('wp_chess_total_games_count', 0) + 1;
     update_option('wp_chess_total_games_count', $cnt);
 
-    $total_players = (int)$wpdb->get_var("SELECT COUNT(*) FROM $table_name");
-    $online_count = wp_chess_get_online_players_count();
-
     return new WP_REST_Response(array(
-        'success' => true,
-        'totalGames' => $cnt,
-        'totalPlayers' => max(1, $total_players),
-        'onlinePlayers' => $online_count
+        'success'       => true,
+        'totalGames'    => $cnt,
+        'totalPlayers'  => max(1, (int) $wpdb->get_var("SELECT COUNT(*) FROM $table_name")),
+        'onlinePlayers' => wp_chess_get_online_players_count(),
     ), 200);
 }
 
 /**
- * Миттєве надання PRO при переході на Приват-Конверт
- */
-function wp_chess_api_instant_pro($request) {
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-
-    $params = $request->get_json_params();
-    $email = sanitize_email($params['email'] ?? '');
-    $username = sanitize_text_field($params['username'] ?? 'Player');
-
-    $wp_uid = get_current_user_id();
-    if (!$wp_uid && !empty($email)) {
-        $wp_u = get_user_by('email', $email);
-        if ($wp_u) {
-            $wp_uid = $wp_u->ID;
-        }
-    }
-
-    // 1. Оновлюємо статус у локальній таблиці шахістів на PRO
-    if (!empty($email)) {
-        $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table_name WHERE email = %s", $email));
-        if ($exists) {
-            $wpdb->update($table_name, array('status' => 'PRO'), array('email' => $email));
-        } else {
-            $wpdb->insert($table_name, array(
-                'username' => $username,
-                'email' => $email,
-                'password_hash' => wp_hash_password('chess_player'),
-                'status' => 'PRO',
-                'registered_at' => current_time('mysql'),
-            ));
-        }
-    }
-
-    // 2. Взаємодія з окремим плагіном монетизації користувача (проект Шахи PRO, ID 3)
-    if ($wp_uid > 0) {
-        update_user_meta($wp_uid, '_wcc_user_premium_3', '1');
-        update_user_meta($wp_uid, 'wcc_chess_pro', '1');
-        if (function_exists('wcc_set_user_premium')) {
-            wcc_set_user_premium($wp_uid, 3, true);
-        }
-        // Хук для сторонніх плагінів
-        do_action('wcc_user_transitioned_to_privat', $wp_uid, 3, $email);
-    }
-
-    return new WP_REST_Response(array(
-        'success' => true,
-        'isPremium' => true,
-        'status' => 'PRO',
-        'message' => 'PRO активовано миттєво з переходом на Приват-Конверт'
-    ), 200);
-}
-
-/**
- * Інтеграція UA Pay Box: миттєва активація PRO та отримання посилання на оплату
+ * Миттєва активація PRO при переході до оплати (Приват-Конверт).
+ * Гравець має бути зареєстрований; адміністратор потім підтверджує оплату або блокує PRO.
  */
 function wp_chess_api_activate_pro($request) {
-    // 1. Виклик функції активації через UA Pay Box Hub
-    $res = chess_activate_pro();
-
-    // 2. Оновлюємо статус поточного користувача
-    $params = is_object($request) && method_exists($request, 'get_json_params') ? $request->get_json_params() : array();
-    $email = !empty($params['userEmail']) ? sanitize_email($params['userEmail']) : (!empty($params['email']) ? sanitize_email($params['email']) : '');
-    $user_id = !empty($params['userId']) ? absint($params['userId']) : get_current_user_id();
-
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-    if ($user_id > 0) {
-        $wpdb->update($table_name, array('status' => 'PRO'), array('id' => $user_id));
-        update_user_meta($user_id, '_wcc_user_premium_3', '1');
-        update_user_meta($user_id, 'wcc_chess_pro', '1');
-        if (function_exists('wcc_set_user_premium')) {
-            wcc_set_user_premium($user_id, 3, true);
-        }
+    $p = wp_chess_json_params($request);
+    $email = sanitize_email(strtolower(trim((string) ($p['userEmail'] ?? $p['email'] ?? ''))));
+    if ($email === '' && is_user_logged_in()) {
+        $email = strtolower(wp_get_current_user()->user_email);
     }
-    if (!empty($email)) {
-        $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table_name WHERE email = %s", $email));
-        if ($exists) {
-            $wpdb->update($table_name, array('status' => 'PRO'), array('email' => $email));
-        } else {
-            $wpdb->insert($table_name, array(
-                'username' => explode('@', $email)[0],
-                'email' => $email,
-                'password_hash' => wp_hash_password('chess_player'),
-                'status' => 'PRO',
-                'registered_at' => current_time('mysql'),
-            ));
-        }
+    if ($email === '') {
+        return wp_chess_error('Спочатку увійдіть або зареєструйтесь');
     }
-
-    if (is_wp_error($res)) {
-        $fallback_url = get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-        return new WP_REST_Response(array(
-            'success' => true,
-            'url' => $fallback_url,
-            'state' => 'active',
-            'fallback' => true,
-            'message' => $res->get_error_message(),
-        ), 200);
+    if (!wp_chess_grant_pro($email)) {
+        return wp_chess_error('Гравця з такою поштою не знайдено. Зареєструйтесь у грі.');
     }
-
-    $url = (is_array($res) && isset($res['url'])) ? $res['url'] : get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09');
-    $state = (is_array($res) && isset($res['state'])) ? $res['state'] : 'active';
-
     return new WP_REST_Response(array(
-        'success' => true,
-        'url' => $url,
-        'state' => $state,
-        'data' => $res,
+        'success'   => true,
+        'isPremium' => true,
+        'status'    => 'PRO',
+        'url'       => get_option('wp_chess_card_url', 'https://www.privat24.ua/send/k4m09'),
     ), 200);
-}
-
-function wp_chess_api_payment_webhook($request) {
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'chess_players';
-
-    $params = $request->get_json_params();
-    $email = sanitize_email($params['user_email'] ?? $params['payer_email'] ?? '');
-    $user_id = absint($params['custom'] ?? $params['user_id'] ?? 0);
-
-    if ($user_id > 0) {
-        $wpdb->update($table_name, array('status' => 'PRO'), array('id' => $user_id));
-        return new WP_REST_Response(array('success' => true, 'updated_id' => $user_id), 200);
-    } elseif (!empty($email)) {
-        $existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table_name WHERE email = %s", $email));
-        if ($existing) {
-            $wpdb->update($table_name, array('status' => 'PRO'), array('id' => $existing));
-        } else {
-            $wpdb->insert($table_name, array(
-                'username' => explode('@', $email)[0],
-                'email' => $email,
-                'password_hash' => wp_hash_password('chess_player'),
-                'status' => 'PRO',
-                'registered_at' => current_time('mysql'),
-            ));
-        }
-        return new WP_REST_Response(array('success' => true, 'updated_email' => $email), 200);
-    }
-
-    return new WP_REST_Response(array('success' => false, 'message' => 'Invalid parameters'), 400);
 }
 
 /**
@@ -1503,14 +1236,13 @@ function wp_chess_ensure_local_app($force = false) {
 
 /**
  * 12. Розпакування вбудованого автономного двигуна гри
- * Використовує чистий base64_decode без сторонніх бібліотек чи zlib
  */
 function wp_chess_decode_embedded_payload() {
     static $cached = null;
     if ($cached !== null) {
         return $cached;
     }
-    $payload = 'PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9IlVURi04IiAvPgogICAgPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiIC8+CiAgICA8dGl0bGU+0KjQsNGF0Lgg0L/RgNC+0YLQuCDQqNCGPC90aXRsZT4KICAgIDxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSLQn9C+0LLQvdC+0YTRg9C90LrRhtGW0L7QvdCw0LvRjNC90LAg0YjQsNGF0L7QstCwINCz0YDQsCDQtyDQsNC90LDQu9GW0LfQvtC8INC/0LDRgNGC0ZbQuSwg0YLQsNC50LzQtdGA0LDQvNC4INGC0LAg0LPQvdGD0YfQutC40LzQuCDQvdCw0LvQsNGI0YLRg9Cy0LDQvdC90Y/QvNC4LiIgLz4KICAgIDxtZXRhIHByb3BlcnR5PSJvZzp0aXRsZSIgY29udGVudD0i0KjQsNGF0Lgg0L/RgNC+0YLQuCDQqNCGIiAvPgogICAgPG1ldGEgcHJvcGVydHk9Im9nOmRlc2NyaXB0aW9uIiBjb250ZW50PSLQn9C+0LLQvdC+0YTRg9C90LrRhtGW0L7QvdCw0LvRjNC90LAg0YjQsNGF0L7QstCwINCz0YDQsCDQtyDQsNC90LDQu9GW0LfQvtC8INC/0LDRgNGC0ZbQuSwg0YLQsNC50LzQtdGA0LDQvNC4INGC0LAg0LPQvdGD0YfQutC40LzQuCDQvdCw0LvQsNGI0YLRg9Cy0LDQvdC90Y/QvNC4LiIgLz4KICAgIDxtZXRhIHByb3BlcnR5PSJvZzp0eXBlIiBjb250ZW50PSJ3ZWJzaXRlIiAvPgogICAgPG1ldGEgbmFtZT0idHdpdHRlcjpjYXJkIiBjb250ZW50PSJzdW1tYXJ5X2xhcmdlX2ltYWdlIiAvPgogICAgPG1ldGEgbmFtZT0idGhlbWUtY29sb3IiIGNvbnRlbnQ9IiMwZjE3MmEiIC8+CiAgICA8bWV0YSBuYW1lPSJtb2JpbGUtd2ViLWFwcC1jYXBhYmxlIiBjb250ZW50PSJ5ZXMiIC8+CiAgICA8bWV0YSBuYW1lPSJhcHBsZS1tb2JpbGUtd2ViLWFwcC1jYXBhYmxlIiBjb250ZW50PSJ5ZXMiIC8+CiAgICA8bWV0YSBuYW1lPSJhcHBsZS1tb2JpbGUtd2ViLWFwcC1zdGF0dXMtYmFyLXN0eWxlIiBjb250ZW50PSJibGFjay10cmFuc2x1Y2VudCIgLz4KICAgIDxtZXRhIG5hbWU9ImFwcGxlLW1vYmlsZS13ZWItYXBwLXRpdGxlIiBjb250ZW50PSJDaGVzcyBQV0EiIC8+CiAgICA8bGluayByZWw9Imljb24iIHR5cGU9ImltYWdlL3N2Zyt4bWwiIGhyZWY9Ii4vaWNvbi5zdmciIC8+CiAgICA8bGluayByZWw9Imljb24iIHR5cGU9ImltYWdlL3gtaWNvbiIgaHJlZj0iLi9mYXZpY29uLmljbyIgLz4KICAgIDxsaW5rIHJlbD0iYXBwbGUtdG91Y2gtaWNvbiIgaHJlZj0iLi9hcHBsZS10b3VjaC1pY29uLnBuZyIgLz4KICAgIDxzY3JpcHQgdHlwZT0ibW9kdWxlIiBjcm9zc29yaWdpbiBzcmM9Ii4vYXNzZXRzL2luZGV4LUJzUGVBZGUwLmpzIj48L3NjcmlwdD4KICAgIDxsaW5rIHJlbD0ic3R5bGVzaGVldCIgY3Jvc3NvcmlnaW4gaHJlZj0iLi9hc3NldHMvaW5kZXgtQ3BwakJZYWwuY3NzIj4KICA8bGluayByZWw9Im1hbmlmZXN0IiBocmVmPSIuL21hbmlmZXN0LndlYm1hbmlmZXN0Ij48c2NyaXB0IGlkPSJ2aXRlLXBsdWdpbi1wd2E6cmVnaXN0ZXItc3ciIHNyYz0iLi9yZWdpc3RlclNXLmpzIj48L3NjcmlwdD48L2hlYWQ+CiAgPGJvZHk+CiAgICA8ZGl2IGlkPSJyb290Ij48L2Rpdj4KICA8L2JvZHk+CjwvaHRtbD4KCg==';
+    $payload = 'PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9InVrIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9IlVURi04IiAvPgogICAgPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiIC8+CiAgICA8dGl0bGU+0KjQsNGF0Lgg0L/RgNC+0YLQuCDQqNCGPC90aXRsZT4KICAgIDxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSLQn9C+0LLQvdC+0YTRg9C90LrRhtGW0L7QvdCw0LvRjNC90LAg0YjQsNGF0L7QstCwINCz0YDQsCDQtyDQsNC90LDQu9GW0LfQvtC8INC/0LDRgNGC0ZbQuSwg0YLQsNC50LzQtdGA0LDQvNC4INGC0LAg0LPQvdGD0YfQutC40LzQuCDQvdCw0LvQsNGI0YLRg9Cy0LDQvdC90Y/QvNC4LiIgLz4KICAgIDxtZXRhIHByb3BlcnR5PSJvZzp0aXRsZSIgY29udGVudD0i0KjQsNGF0Lgg0L/RgNC+0YLQuCDQqNCGIiAvPgogICAgPG1ldGEgcHJvcGVydHk9Im9nOmRlc2NyaXB0aW9uIiBjb250ZW50PSLQn9C+0LLQvdC+0YTRg9C90LrRhtGW0L7QvdCw0LvRjNC90LAg0YjQsNGF0L7QstCwINCz0YDQsCDQtyDQsNC90LDQu9GW0LfQvtC8INC/0LDRgNGC0ZbQuSwg0YLQsNC50LzQtdGA0LDQvNC4INGC0LAg0LPQvdGD0YfQutC40LzQuCDQvdCw0LvQsNGI0YLRg9Cy0LDQvdC90Y/QvNC4LiIgLz4KICAgIDxtZXRhIHByb3BlcnR5PSJvZzp0eXBlIiBjb250ZW50PSJ3ZWJzaXRlIiAvPgogICAgPG1ldGEgbmFtZT0idHdpdHRlcjpjYXJkIiBjb250ZW50PSJzdW1tYXJ5X2xhcmdlX2ltYWdlIiAvPgogICAgPG1ldGEgbmFtZT0idGhlbWUtY29sb3IiIGNvbnRlbnQ9IiMwZjE3MmEiIC8+CiAgICA8bWV0YSBuYW1lPSJtb2JpbGUtd2ViLWFwcC1jYXBhYmxlIiBjb250ZW50PSJ5ZXMiIC8+CiAgICA8bWV0YSBuYW1lPSJhcHBsZS1tb2JpbGUtd2ViLWFwcC1jYXBhYmxlIiBjb250ZW50PSJ5ZXMiIC8+CiAgICA8bWV0YSBuYW1lPSJhcHBsZS1tb2JpbGUtd2ViLWFwcC1zdGF0dXMtYmFyLXN0eWxlIiBjb250ZW50PSJibGFjay10cmFuc2x1Y2VudCIgLz4KICAgIDxtZXRhIG5hbWU9ImFwcGxlLW1vYmlsZS13ZWItYXBwLXRpdGxlIiBjb250ZW50PSLQqNCw0YXQuCDQv9GA0L7RgtC4INCo0IYiIC8+CiAgICA8bGluayByZWw9Imljb24iIHR5cGU9ImltYWdlL3N2Zyt4bWwiIGhyZWY9Ii4vaWNvbi5zdmciIC8+CiAgICA8bGluayByZWw9Imljb24iIHR5cGU9ImltYWdlL3gtaWNvbiIgaHJlZj0iLi9mYXZpY29uLmljbyIgLz4KICAgIDxsaW5rIHJlbD0iYXBwbGUtdG91Y2gtaWNvbiIgaHJlZj0iLi9hcHBsZS10b3VjaC1pY29uLnBuZyIgLz4KICAgIDxzY3JpcHQgdHlwZT0ibW9kdWxlIiBjcm9zc29yaWdpbiBzcmM9Ii4vYXNzZXRzL2luZGV4LTkyZTRlYjcyLmpzIj48L3NjcmlwdD4KICAgIDxsaW5rIHJlbD0ic3R5bGVzaGVldCIgY3Jvc3NvcmlnaW4gaHJlZj0iLi9hc3NldHMvaW5kZXgtMGU4OWZkYTEuY3NzIj4KICA8bGluayByZWw9Im1hbmlmZXN0IiBocmVmPSIuL21hbmlmZXN0LndlYm1hbmlmZXN0Ij48c2NyaXB0IGlkPSJ2aXRlLXBsdWdpbi1wd2E6cmVnaXN0ZXItc3ciIHNyYz0iLi9yZWdpc3RlclNXLmpzIj48L3NjcmlwdD48L2hlYWQ+CiAgPGJvZHk+CiAgICA8ZGl2IGlkPSJyb290Ij48L2Rpdj4KICA8L2JvZHk+CjwvaHRtbD4KCg==';
     $cached = base64_decode($payload);
     return $cached;
 }
